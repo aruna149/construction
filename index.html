@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF Upload | Modern SaaS</title>
+  <meta name="description" content="Securely upload your PDF file for processing. Designed with dynamic themes and drag-and-drop operations.">
+  <link rel="stylesheet" href="style.css">
+  <script>
+    // Immediately apply theme preferences to prevent flash of unstyled content
+    (function() {
+      const savedTheme = localStorage.getItem('theme');
+      const systemPrefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+      if (savedTheme === 'dark' || (!savedTheme && systemPrefersDark)) {
+        document.documentElement.classList.add('dark-mode');
+      } else {
+        document.documentElement.classList.add('light-mode');
+      }
+    })();
+  </script>
+</head>
+<body class="fade-in">
+
+  <!-- Navigation Bar -->
+  <nav class="navbar" aria-label="Main Navigation">
+    <div class="nav-container">
+      <div class="nav-logo" id="navLogo">
+        <!-- SVG PDF Icon -->
+        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/>
+          <polyline points="14 2 14 8 20 8"/>
+        </svg>
+        <span>PDF Upload</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <!-- Object Configuration Page Link -->
+        <a href="dynamic-object/index.html" class="btn btn-secondary" style="text-decoration: none; display: inline-flex; align-items: center; gap: 8px; font-size: 0.875rem; font-weight: 500; padding: 0 16px; border-radius: 10px; height: 40px; border: 1px solid var(--border-color); color: var(--text-color); background-color: var(--card-bg); transition: background-color var(--transition-fast), border-color var(--transition-fast);">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--primary-color);">
+            <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+            <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+            <line x1="12" y1="22.08" x2="12" y2="12"/>
+          </svg>
+          Configure Objects
+        </a>
+
+        <!-- Theme Toggle Button -->
+        <button id="themeToggle" class="theme-toggle-btn" aria-label="Toggle light or dark mode">
+          <!-- Sun Icon (shows in dark mode) -->
+          <svg class="sun-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="5"/>
+            <line x1="12" y1="1" x2="12" y2="3"/>
+            <line x1="12" y1="21" x2="12" y2="23"/>
+            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+            <line x1="1" y1="12" x2="3" y2="12"/>
+            <line x1="21" y1="12" x2="23" y2="12"/>
+            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+          </svg>
+          <!-- Moon Icon (shows in light mode) -->
+          <svg class="moon-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </nav>
+
+  <!-- Main Container -->
+  <main class="main-content">
+    <div class="card card-upload">
+      
+      <!-- Card Header -->
+      <header class="card-header">
+        <h1 class="card-title" id="uploadTitle">Upload PDF Documents</h1>
+        <p class="card-subtitle" id="uploadSubtitle">Securely upload your PDF file for processing.</p>
+      </header>
+
+      <!-- Drag & Drop Upload Zone -->
+      <section 
+        class="upload-zone" 
+        id="dropZone" 
+        tabindex="0" 
+        role="button" 
+        aria-controls="pdfFileInput" 
+        aria-describedby="uploadTitle uploadSubtitle"
+        aria-label="Drag and drop a PDF file here or click to browse">
+        
+        <!-- Hidden Native File Input -->
+        <input type="file" id="pdfFileInput" class="file-input" accept=".pdf" />
+
+        <div class="upload-icon-container" aria-hidden="true">
+          <!-- Cloud Upload SVG -->
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+        </div>
+
+        <span class="upload-text">Drag & Drop your PDF here</span>
+        <span class="upload-divider">or</span>
+        
+        <!-- Primary Browse Button -->
+        <button type="button" class="btn btn-primary" id="browseBtn" tabindex="-1">
+          Browse PDF File
+        </button>
+
+        <!-- Footer terms / size limitations -->
+        <div class="upload-footer">
+          <span>Only PDF (.pdf)</span>
+          <span aria-hidden="true">•</span>
+          <span>Maximum Size: 25 MB</span>
+        </div>
+      </section>
+
+      <!-- Upload Progress Section -->
+      <section class="progress-card" id="progressCard" aria-live="polite">
+        <div class="progress-header">
+          <div class="file-icon" aria-hidden="true">
+            <!-- Modern PDF File Symbol -->
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/>
+              <polyline points="14 2 14 8 20 8"/>
+              <line x1="9" y1="15" x2="15" y2="15"/>
+              <line x1="9" y1="11" x2="15" y2="11"/>
+              <line x1="9" y1="18" x2="11" y2="18"/>
+            </svg>
+          </div>
+          
+          <div class="file-details">
+            <div class="file-name" id="fileNameDisplay" title="">
+              <span id="fileNameText">Project_Document.pdf</span>
+            </div>
+            <div class="file-size" id="fileSizeDisplay">0.0 MB</div>
+          </div>
+        </div>
+
+        <div class="progress-stats">
+          <span class="progress-status" id="progressStatusText">Uploading...</span>
+          <span class="progress-percent" id="progressPercentText">0%</span>
+        </div>
+
+        <div class="progress-track">
+          <div class="progress-bar-fill" id="progressBarFill" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+        </div>
+      </section>
+
+      <!-- Client-side Error Banner -->
+      <div class="error-banner" id="errorBanner" role="alert">
+        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="12"/>
+          <line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        <span id="errorText">An error occurred during file parsing.</span>
+      </div>
+
+    </div>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>
