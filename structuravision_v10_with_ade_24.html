@@ -339,7 +339,7 @@ body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);min
 </head>
 <body>
 <div class="hdr"><div class="logo">S</div><div class="brand"><h1>StructuraVision</h1><span>AI Drawing Intelligence</span></div><div class="hdr-right"><div class="status" id="stb"><div class="dot"></div><span>Ready</span></div></div></div>
-<div class="uv" id="UV"><div class="uc" id="UC"><div class="ui"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 12 15 15"/></svg></div><h2>StructuraVision</h2><p>Upload structural PDF &mdash; grids, distances, perimeters &amp; wall detection</p><button class="ubtn" onclick="document.getElementById('fIn').click()">Upload PDF</button><button class="bn" style="display:block;margin:12px auto 0" onclick="document.getElementById('symbolImageIn').click()">Identify Image / Symbol</button></div><input type="file" id="fIn" accept=".pdf"/><input type="file" id="symbolImageIn" accept="image/*" style="display:none"/></div>
+<div class="uv" id="UV"><div class="uc" id="UC"><div class="ui"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 12 15 15"/></svg></div><h2>StructuraVision</h2><p>Upload structural PDF &mdash; grids, distances, perimeters &amp; wall detection. Small scans use local OCR; use ADE for full multi-page raster plans.</p><button class="ubtn" onclick="document.getElementById('fIn').click()">Upload PDF</button><button class="bn" style="display:block;margin:12px auto 0" onclick="document.getElementById('symbolImageIn').click()">Identify Image / Symbol</button></div><input type="file" id="fIn" accept=".pdf"/><input type="file" id="symbolImageIn" accept="image/*" style="display:none"/></div>
 <div class="pv" id="PV"><div class="spin"></div><div style="font-size:18px;font-weight:600">Analyzing Drawing...</div><div style="font-size:13px;color:var(--dim);margin-top:8px" id="pTxt">Loading</div><div class="pw"><div class="pfill" id="pFl"></div></div></div>
 <div class="rv" id="RV">
 <!-- ══ SYMBOL LEGEND ══ -->
@@ -409,7 +409,9 @@ var FK=[
 ];
 var EXCL=['SECTION','DETAIL','SCHEDULE','GENERAL NOTES','ELEVATION','TYPICAL'];
 var PDF=null;
+var __SV_AUTO_OCR_NOTE = '';
 var canvasRegistry={};
+var PAGE_RENDER_PROMISES={};
 var VERTICAL_GUIDE_MAP = {};
 
 var uc=document.getElementById('UC');
@@ -506,10 +508,158 @@ function backendImageFor(secNum, sheetKey) {
   return null;
 }
 
+function needsAutomaticOCR(page) {
+  var alphanumeric = (page.rawText || '').match(/[A-Z0-9]/gi) || [];
+  return page.items.length < 3 || alphanumeric.length < 8;
+}
+
+async function OCRSparsePages(pages) {
+  var targets = pages.filter(needsAutomaticOCR);
+  if (!targets.length) return;
+  if (targets.length > 5) {
+    __SV_AUTO_OCR_NOTE = 'Found ' + targets.length + ' low-text pages. Automatic local OCR was skipped to keep the browser responsive. Use ADE Extract for full-document image/layout analysis, or run Open OCR manually for free text recognition.';
+    return;
+  }
+
+  var worker = null;
+  var pagesRead = 0;
+  var activeIndex = 0;
+  var firstError = '';
+  try {
+    sp(45, 'Loading local OCR for scanned pages...');
+    await ensureTesseractLoaded();
+    worker = await Tesseract.createWorker('eng', 1, {
+      logger: function(m) {
+        if (m && typeof m.progress === 'number') {
+          sp(45 + ((activeIndex + m.progress) / targets.length) * 5,
+             'Reading scanned page ' + (activeIndex + 1) + ' of ' + targets.length + '...');
+        }
+      }
+    });
+    __OCR_WORKER = worker;
+    await worker.setParameters({ tessedit_pageseg_mode: '11' });
+  } catch (e) {
+    firstError = e.message || String(e);
+    console.warn('[Auto OCR] Could not start local OCR:', firstError);
+    if (worker) {
+      try {
+        await worker.terminate();
+      } catch (cleanupError) {
+        console.warn('[Auto OCR] Worker cleanup failed:', cleanupError);
+      }
+      worker = null;
+      __OCR_WORKER = null;
+    }
+  }
+
+  if (!worker) {
+    __SV_AUTO_OCR_NOTE = 'Automatic OCR could not start: ' + firstError +
+      '. Use the Open OCR tab to retry, or configure ADE for image-based extraction.';
+    return;
+  }
+
+  var failedPages = [];
+  try {
+    for (var i = 0; i < targets.length; i++) {
+      var page = targets[i];
+      activeIndex = i;
+      var canvas = document.createElement('canvas');
+      try {
+        var pdfPage = await PDF.getPage(page.num);
+        var baseViewport = pdfPage.getViewport({ scale: 1 });
+        var scale = Math.min(1.25, 2400 / Math.max(baseViewport.width, baseViewport.height, 1));
+        var viewport = pdfPage.getViewport({ scale: scale });
+        canvas.width = Math.ceil(viewport.width);
+        canvas.height = Math.ceil(viewport.height);
+        await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport: viewport }).promise;
+        var ocrCanvas = preprocessForOCR(canvas);
+        var result;
+        try {
+          result = await worker.recognize(ocrCanvas);
+        } finally {
+          ocrCanvas.width = 0;
+          ocrCanvas.height = 0;
+        }
+        var words = ((result.data && result.data.words) || []).map(function(word) {
+          var text = String(word.text || '').trim();
+          var box = word.bbox || {};
+          if (!text || (isFinite(word.confidence) && word.confidence < 30) ||
+              box.x0 == null || box.y0 == null || box.x1 == null || box.y1 == null ||
+              box.x1 <= box.x0 || box.y1 <= box.y0) return null;
+          return {
+            text: text,
+            x: box.x0 / scale,
+            y: box.y0 / scale,
+            w: (box.x1 - box.x0) / scale,
+            h: (box.y1 - box.y0) / scale
+          };
+        }).filter(function(word) { return !!word; });
+
+        if (!words.length) {
+          failedPages.push(page.num);
+          continue;
+        }
+
+        var nativeItems = page.items;
+        var additions = words.filter(function(word) {
+          var key = word.text.toUpperCase().replace(/[^A-Z0-9]/g, '');
+          if (!key) return true;
+          return !nativeItems.some(function(native) {
+            var nativeKey = native.text.toUpperCase().replace(/[^A-Z0-9]/g, '');
+            return nativeKey === key &&
+              Math.abs(native.x - word.x) < 8 && Math.abs(native.y - word.y) < 8;
+          });
+        });
+        page.items = nativeItems.concat(additions).sort(function(a, b) {
+          return a.y - b.y || a.x - b.x;
+        });
+        page.rawText = page.items.map(function(item) { return item.text; }).join(' ');
+        page.full = page.rawText.toUpperCase();
+        pagesRead++;
+      } catch (e) {
+        failedPages.push(page.num);
+        if (!firstError) firstError = e.message || String(e);
+        console.warn('[Auto OCR] Page ' + page.num + ' failed:', e);
+      } finally {
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+      sp(45 + ((i + 1) / targets.length) * 5,
+         'Reading scanned page ' + (i + 1) + ' of ' + targets.length + '...');
+    }
+  } finally {
+    try {
+      await worker.terminate();
+    } catch (e) {
+      console.warn('[Auto OCR] Worker cleanup failed:', e);
+    }
+    __OCR_WORKER = null;
+  }
+
+  var note = 'Local OCR read ' + pagesRead + ' of ' + targets.length + ' low-text page' +
+    (targets.length === 1 ? '' : 's') + '.';
+  if (failedPages.length) {
+    note += ' No readable text was recovered from page' +
+      (failedPages.length === 1 ? ' ' : 's ') + failedPages.join(', ') + '.';
+    if (firstError) note += ' ' + firstError;
+    note += ' Review the Open OCR tab or use ADE for image-based extraction.';
+  }
+  __SV_AUTO_OCR_NOTE = note;
+  console.log('[Auto OCR]', note);
+}
+
 async function go(file){
+  if (ADE_ACTIVE_JOB_ID && __ADE_LAST_FILE !== file) {
+    if (!window.confirm('An ADE Parse Job is still running and may incur a charge. Upload a different PDF anyway?')) return;
+    ADE_ACTIVE_JOB_ID = null;
+  }
+  __SV_AUTO_OCR_NOTE = '';
+  __ADE_LAST_FILE = file;
+  DOCLING_RESULT = null;
+  DOCLING_ERROR = '';
+  DOCLING_PROGRESS = '';
   uploadToBackend(file);  // fire-and-forget; client-side analysis continues
   fetchStaircasesPy(file); // fire-and-forget; staircase API runs alongside
-  fetchADEExtraction(file); // fire-and-forget; LandingAI ADE document parse runs alongside
   sv('proc');sp(5,'Loading PDF...');
   document.getElementById('fName').textContent=file.name;
   try{
@@ -525,6 +675,8 @@ async function go(file){
       if(!gSc){var s=fSc(items);if(s)gSc=s}
       sp(10+(i/N)*35,'Reading page '+i+'/'+N);
     }
+    await OCRSparsePages(pages);
+    if(!gSc){for(var oi=0;oi<pages.length;oi++){var os=fSc(pages[oi].items);if(os){gSc=os;break}}}
     sp(50,'Detecting grids & walls...');
     var _pdfTextMap = {}; // store text items per page for LGS classification
     pages.forEach(function(pd){ _pdfTextMap[pd.num] = pd.items; });
@@ -544,6 +696,7 @@ async function go(file){
     sp(52, 'Detecting staircase symbols...');
     for (var si = 0; si < pages.length; si++) {
       var spd = pages[si];
+      sp(52, 'Checking vector geometry on page ' + spd.num + ' of ' + pages.length + '...');
       try {
         var spg = await PDF.getPage(spd.num);
         var ops = await spg.getOperatorList();
@@ -2250,14 +2403,7 @@ renderAll = async function(all, floors, N, totalW) {
     var reg = canvasRegistry[i];
     if (!reg) continue;
     try {
-      var pdfPg2 = await PDF.getPage(pg.pn);
-      var tc2 = await pdfPg2.getTextContent();
-      var vp2 = pdfPg2.getViewport({ scale: 1 });
-      var items2 = tc2.items.map(function(it) {
-        return { text: it.str.trim(), x: it.transform[4], y: vp2.height - it.transform[5] };
-      }).filter(function(it){ return it.text.length > 0; });
-
-      var refs = extractSectionRefs(items2);
+      var refs = extractSectionRefs(pg.items || []);
       if (refs.length) {
         PAGE_SEC_REFS[i] = refs;
         drawSectionRefsOnCanvas(reg.canvas, refs, reg.scale, i);
@@ -3067,36 +3213,25 @@ async function renderAll(all,floors,N,totalW){
       if(sPages.length)out+='<div class="stat" style="border-color:rgba(167,139,250,.3)"><div class="stat-l" style="color:#c4b5fd">Stair Pages</div><div class="stat-v" style="font-size:14px;color:#c4b5fd">'+sPages.join(', ')+'</div><div class="stat-s">stair detected</div></div>';
       return out;
     }());
+  if (__SV_AUTO_OCR_NOTE) {
+    document.getElementById('SR').insertAdjacentHTML('afterbegin',
+      '<div role="status" style="flex:1 0 100%;padding:12px 16px;border:1px solid rgba(34,211,238,.3);' +
+      'border-radius:10px;background:rgba(34,211,238,.07);color:var(--dim);font-size:12px;line-height:1.6">' +
+      escHtml(__SV_AUTO_OCR_NOTE) + '</div>');
+  }
   var tabs='<button class="tab ftab active" onclick="swT(event,\'sum\')">Summary</button>'
     + '<button class="tab ftab" onclick="swT(event,\'ade\')">\uD83E\uDDEC ADE Extract</button>'
+    + '<button class="tab ftab" onclick="swT(event,\'docling\')">\uD83D\uDCE6 Local Docling</button>'
     + '<button class="tab ftab" onclick="swT(event,\'ocr\')">\uD83D\uDD13 Open OCR</button>';
   all.forEach(function(pg,i){var cls=pg.isFloor?'ftab':'dtab';tabs+='<button class="tab '+cls+'" onclick="swT(event,\'p'+i+'\')">'+(pg.sheet||'Pg'+pg.pn)+' - '+pg.name+(pg.walls.length?' ('+pg.walls.length+' walls)':'')+'</button>'});
   document.getElementById('TW').innerHTML=tabs;
   var html=rSum(floors,all);
   html += '<div class="tc" id="tab-ade">' + buildADEPanel(ADE_RESULT, ADE_ERROR, !ADE_RESULT && !ADE_ERROR && !getADEApiKey()) + '</div>';
+  html += '<div class="tc" id="tab-docling">' + buildDoclingPanel() + '</div>';
   html += '<div class="tc" id="tab-ocr">' + buildOCRPanel(null) + '</div>';
   all.forEach(function(pg,i){html+=rPage(pg,i,all)});
   document.getElementById('TC').innerHTML=html;
-  // Render PDF canvases with wall overlays
-  for(var i=0;i<all.length;i++){
-    var c=document.getElementById('pcvs-'+i);if(!c)continue;
-    try{
-      var pg=await PDF.getPage(all[i].pn);
-      var sc=0.5;var vp=pg.getViewport({scale:sc});
-      c.width=vp.width;c.height=vp.height;
-      await pg.render({canvasContext:c.getContext('2d'),viewport:vp}).promise;
-      canvasRegistry[i]={canvas:c,pageIdx:i,walls:all[i].walls,vGuide:all[i].vGuide||[],scale:sc,pdfPage:all[i].pn,vpW:vp.width/sc,vpH:vp.height/sc};
-      // Size the LB highlighter overlay to match the PDF canvas
-      var ov_=document.getElementById('hlcvs-'+i);
-      if(ov_){ov_.width=vp.width;ov_.height=vp.height;hlRestorePage(i);}
-      if(all[i].walls.length>0){
-        drawWallsOnCanvas(c,all[i].walls,sc,null,all[i].pn,all[i].vGuide||[]);
-      }
-      drawStairRegionOverlays(c, all[i].pn, sc);
-      drawStairShapes(c, all[i].pn, sc);
-      drawStaircasePyOnCanvas(c, all[i].pn, sc);
-    }catch(e){console.error('Canvas render error:',e)}
-  }
+  // Render each PDF canvas on demand when its page tab is opened.
   // ── Inject stair highlight button into LGS legend strip ──
   var lgsLeg = document.querySelector('.lgs-legend');
   if (lgsLeg && !document.getElementById('stairHlBtn')) {
@@ -3117,7 +3252,74 @@ async function renderAll(all,floors,N,totalW){
   }
 }
 
+async function ensurePageCanvas(pageIdx) {
+  if (canvasRegistry[pageIdx]) return;
+  var renderPromises = PAGE_RENDER_PROMISES;
+  if (renderPromises[pageIdx]) return renderPromises[pageIdx];
+  var all = __SV_ALL_PAGES || [];
+  var pageInfo = all[pageIdx];
+  var canvas = document.getElementById('pcvs-' + pageIdx);
+  if (!pageInfo || !canvas || !PDF) return;
+
+  var documentRef = PDF;
+  var renderPromise = (async function() {
+    try {
+      var pdfPage = await documentRef.getPage(pageInfo.pn);
+      var scale = 0.5;
+      var viewport = pdfPage.getViewport({ scale: scale });
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport: viewport }).promise;
+      if (documentRef !== PDF) return;
+
+      var reg = {
+        canvas: canvas,
+        pageIdx: pageIdx,
+        walls: pageInfo.walls,
+        vGuide: pageInfo.vGuide || [],
+        scale: scale,
+        pdfPage: pageInfo.pn,
+        vpW: viewport.width / scale,
+        vpH: viewport.height / scale
+      };
+      canvasRegistry[pageIdx] = reg;
+
+      var overlay = document.getElementById('hlcvs-' + pageIdx);
+      if (overlay) {
+        overlay.width = viewport.width;
+        overlay.height = viewport.height;
+        hlRestorePage(pageIdx);
+      }
+      if (pageInfo.walls.length) {
+        drawWallsOnCanvas(canvas, pageInfo.walls, scale, null, pageInfo.pn, pageInfo.vGuide || []);
+      }
+      drawStairRegionOverlays(canvas, pageInfo.pn, scale);
+      drawStairShapes(canvas, pageInfo.pn, scale);
+      drawStaircasePyOnCanvas(canvas, pageInfo.pn, scale);
+      drawSymbolsOnCanvas(canvas, SYM_DB[pageInfo.pn] || [], scale, null);
+      if (typeof SF_DB !== 'undefined' && SF_DB[pageInfo.pn]) {
+        drawStructuralFeatures(canvas, SF_DB[pageInfo.pn], scale);
+      }
+      drawADEGroundingOnCanvas(canvas, pageIdx, scale);
+      var refs = PAGE_SEC_REFS[pageIdx] || [];
+      if (refs.length) {
+        drawSectionRefsOnCanvas(canvas, refs, scale, pageIdx);
+        canvas.style.cursor = 'pointer';
+        canvas.addEventListener('click', function(event) { handleCanvasSecClick(event, pageIdx); });
+      }
+    } catch (e) {
+      console.error('Canvas render error on page ' + pageInfo.pn + ':', e);
+      throw e;
+    } finally {
+      delete renderPromises[pageIdx];
+    }
+  })();
+  renderPromises[pageIdx] = renderPromise;
+  return renderPromise;
+}
+
 async function highlightWall(tabIdx,wallId){
+  await ensurePageCanvas(tabIdx);
   var reg=canvasRegistry[tabIdx];if(!reg)return;
   var c=reg.canvas;
   var pg=await PDF.getPage(reg.pdfPage);
@@ -3138,7 +3340,7 @@ async function highlightWall(tabIdx,wallId){
 
 function rSum(floors,all){
   var rows='';floors.forEach(function(f){var p=f.perim;var idx=all.indexOf(f);
-    rows+='<tr style="cursor:pointer" onclick="document.querySelectorAll(\'.tab\')['+(idx+1)+'].click()"><td>'+f.pn+'</td><td class="mn">'+f.sheet+'</td><td><span class="ft '+f.type+'">'+f.name+'</span></td><td>'+f.lG.length+'</td><td>'+f.nG.length+'</td><td class="mn" style="color:var(--cyan)">'+(p?p.lT||ff(p.l):'--')+'</td><td class="mn" style="color:var(--cyan)">'+(p?p.wT||ff(p.w):'--')+'</td><td class="mn" style="color:var(--green);font-weight:700">'+(p&&p.p?ff(p.p):'--')+'</td><td style="color:var(--red);font-weight:700">'+(f.walls.length||'--')+'</td><td class="mn">'+(f.scale?f.scale.disp:'N/A')+'</td></tr>'});
+    rows+='<tr style="cursor:pointer" onclick="document.querySelectorAll(\'.tab\')['+(idx+3)+'].click()"><td>'+f.pn+'</td><td class="mn">'+f.sheet+'</td><td><span class="ft '+f.type+'">'+f.name+'</span></td><td>'+f.lG.length+'</td><td>'+f.nG.length+'</td><td class="mn" style="color:var(--cyan)">'+(p?p.lT||ff(p.l):'--')+'</td><td class="mn" style="color:var(--cyan)">'+(p?p.wT||ff(p.w):'--')+'</td><td class="mn" style="color:var(--green);font-weight:700">'+(p&&p.p?ff(p.p):'--')+'</td><td style="color:var(--red);font-weight:700">'+(f.walls.length||'--')+'</td><td class="mn">'+(f.scale?f.scale.disp:'N/A')+'</td></tr>'});
 
   // Build vertical cores summary across all pages
   var coresSummary = '';
@@ -3156,7 +3358,7 @@ function rSum(floors,all){
       var f = PAGE_FLAGS[pg.pn] || {};
       var stairW = pg.walls.filter(function(w){ return getLgsType(w,pg.pn)==='STAIR'; });
       var elevW  = pg.walls.filter(function(w){ return getLgsType(w,pg.pn)==='ELEV';  });
-      coresSummary += '<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:10px;cursor:pointer" onclick="document.querySelectorAll(\'.tab\')['+(idx+1)+'].click()">';
+      coresSummary += '<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:10px;cursor:pointer" onclick="document.querySelectorAll(\'.tab\')['+(idx+3)+'].click()">';
       coresSummary += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap">';
       coresSummary += '<span style="font-weight:700;color:var(--text);font-size:13px">Page '+pg.pn+' — '+(pg.sheet||'')+'</span>';
       coresSummary += '<span style="font-size:12px;color:var(--muted)">'+pg.name+'</span>';
@@ -3456,11 +3658,11 @@ function rPage(pg,idx,all){
   h+='</div></div></div>';return h;
 }
 
-function swT(ev,id){document.querySelectorAll('.tab').forEach(function(b){b.classList.remove('active')});document.querySelectorAll('.tc').forEach(function(c){c.classList.remove('active')});ev.target.classList.add('active');document.getElementById('tab-'+id).classList.add('active')}
+function swT(ev,id){document.querySelectorAll('.tab').forEach(function(b){b.classList.remove('active')});document.querySelectorAll('.tc').forEach(function(c){c.classList.remove('active')});ev.target.classList.add('active');document.getElementById('tab-'+id).classList.add('active');if(/^p\d+$/.test(id))ensurePageCanvas(+id.slice(1)).catch(function(e){console.error('Could not open PDF page '+id+':',e);});}
 function swST(idx,panel){var tabs=document.querySelectorAll('#tab-p'+idx+' .stab');tabs.forEach(function(t){t.classList.toggle('active',t.textContent.toLowerCase().indexOf(panel)>=0)});var panels=document.querySelectorAll('#tab-p'+idx+' .spanel');panels.forEach(function(p){p.classList.toggle('active',p.id==='sp-'+idx+'-'+panel)})}
 function sv(v){document.getElementById('UV').style.display=v==='upload'?'flex':'none';document.getElementById('PV').style.display=v==='proc'?'flex':'none';document.getElementById('RV').style.display=v==='results'?'block':'none';var b=document.getElementById('stb');if(v==='proc')b.innerHTML='<div class="dot" style="background:var(--amber)"></div><span style="color:var(--amber)">Processing</span>';else if(v==='results')b.innerHTML='<div class="dot"></div><span>Analysis Complete</span>';else b.innerHTML='<div class="dot"></div><span>Ready</span>'}
 function sp(p,t){document.getElementById('pFl').style.width=p+'%';if(t)document.getElementById('pTxt').textContent=t}
-function resetApp(){sv('upload');document.getElementById('fIn').value='';document.getElementById('pFl').style.width='0%';canvasRegistry={};ADE_RESULT=null;ADE_ERROR=null;OCR_RESULT=null;OCR_RUNNING=false;__SV_ALL_PAGES=null;if(typeof SF_DB!=='undefined')SF_DB={};if(typeof SECTION_INFO_DB!=='undefined')SECTION_INFO_DB={};if(typeof SECTION_DETAIL_DB!=='undefined')SECTION_DETAIL_DB={};if(typeof PAGE_SEC_REFS!=='undefined')PAGE_SEC_REFS={};if(typeof HL_DRAW_BOX!=='undefined')HL_DRAW_BOX={};var prev=document.getElementById('sec-keynote-panel');if(prev)prev.remove();closeSecCropDock();var d=document.getElementById('sec-crop-dock');if(d)d.remove();}
+function resetApp(){if(ADE_ACTIVE_JOB_ID&&!window.confirm('An ADE Parse Job is still running and cannot be cancelled here. It may still incur a charge. Start a new upload anyway?'))return;if(ADE_ACTIVE_JOB_ID)ADE_ACTIVE_JOB_ID=null;ADE_PROGRESS='';__ADE_LAST_FILE=null;DOCLING_RESULT=null;DOCLING_ERROR='';DOCLING_PROGRESS='';sv('upload');document.getElementById('fIn').value='';document.getElementById('pFl').style.width='0%';canvasRegistry={};PAGE_RENDER_PROMISES={};ADE_RESULT=null;ADE_ERROR=null;OCR_RESULT=null;OCR_RUNNING=false;__SV_ALL_PAGES=null;__SV_AUTO_OCR_NOTE='';if(typeof SF_DB!=='undefined')SF_DB={};if(typeof SECTION_INFO_DB!=='undefined')SECTION_INFO_DB={};if(typeof SECTION_DETAIL_DB!=='undefined')SECTION_DETAIL_DB={};if(typeof PAGE_SEC_REFS!=='undefined')PAGE_SEC_REFS={};if(typeof HL_DRAW_BOX!=='undefined')HL_DRAW_BOX={};var prev=document.getElementById('sec-keynote-panel');if(prev)prev.remove();closeSecCropDock();var d=document.getElementById('sec-crop-dock');if(d)d.remove();}
 
 
 
@@ -3659,20 +3861,7 @@ renderAll = async function(all, floors, N, totalW) {
   for (var i = 0; i < all.length; i++) {
     var pg = all[i];
     try {
-      var pdfPg = await PDF.getPage(pg.pn);
-      var tc    = await pdfPg.getTextContent();
-      var vp    = pdfPg.getViewport({ scale: 1 });
-      var items = tc.items
-        .map(function(it) {
-          return {
-            text: it.str.trim(),
-            x:    it.transform[4],
-            y:    vp.height - it.transform[5],
-            w:    it.width,
-            h:    it.height
-          };
-        })
-        .filter(function(it) { return it.text.length > 0; });
+      var items = pg.items || [];
 
       var syms = extractSymbols(pg.pn, items, pg.sheet || ('Pg' + pg.pn), pg.name);
       SYM_DB[pg.pn] = syms;
@@ -4104,7 +4293,7 @@ var _origRenderAll_sf=renderAll;
 renderAll=async function(all,floors,N,totalW){
   await _origRenderAll_sf(all,floors,N,totalW);
   SF_DB={};
-  for(var i=0;i<all.length;i++){var pg=all[i];try{var pdfPg=await PDF.getPage(pg.pn),tc=await pdfPg.getTextContent(),vp=pdfPg.getViewport({scale:1});var items=tc.items.map(function(it){return{text:it.str.trim(),x:it.transform[4],y:vp.height-it.transform[5],w:it.width,h:it.height};}).filter(function(it){return it.text.length>0;});var W=vp.width,H=vp.height;SF_DB[pg.pn]={xbraces:detectXBraces(items,W,H),perimBoxes:detectPerimeterMembers(items,W,H),nodes:detectColumnNodes(pg,items),secZones:detectSectionZones(items,W,H)};}catch(e){SF_DB[pg.pn]={xbraces:[],perimBoxes:[],nodes:[],secZones:[]};}}
+  for(var i=0;i<all.length;i++){var pg=all[i];try{var items=pg.items||[];var W=pg.W||0,H=pg.H||0;SF_DB[pg.pn]={xbraces:detectXBraces(items,W,H),perimBoxes:detectPerimeterMembers(items,W,H),nodes:detectColumnNodes(pg,items),secZones:detectSectionZones(items,W,H)};}catch(e){SF_DB[pg.pn]={xbraces:[],perimBoxes:[],nodes:[],secZones:[]};}}
   for(var j=0;j<all.length;j++){var reg=canvasRegistry[j];if(!reg)continue;var sf=SF_DB[all[j].pn];if(sf)drawStructuralFeatures(reg.canvas,sf,reg.scale);}
   injectSFLegend();injectSFSubTabs(all);
 };
@@ -4177,12 +4366,7 @@ async function buildSectionInfoDB(allPages) {
     var sheetKey = pg.sheet.toUpperCase().trim();
     if (!sheetKey.match(/^S\d/)) continue;
     try {
-      var pdfPg = await PDF.getPage(pg.pn);
-      var tc    = await pdfPg.getTextContent();
-      var vp    = pdfPg.getViewport({ scale: 1 });
-      var items = tc.items.map(function(it) {
-        return { text: it.str.trim(), x: it.transform[4], y: vp.height - it.transform[5] };
-      }).filter(function(it) { return it.text.length > 0; });
+      var items = pg.items || [];
 
       var keyText = [], seen = {};
       items.forEach(function(it) {
@@ -6277,15 +6461,140 @@ function rerenderPyStaircases() {
  *     markdown, grounding:{page, box}}, ...] }
  *
  * Wire-up:
- *   • go(file)      → fetchADEExtraction(file)  — fires the request
- *   • renderAll()   → placeholder '#tab-ade' panel, filled in on arrival
- *   • resetApp()    → clears ADE_RESULT / ADE_ERROR on a fresh upload
+ *   • go(file)      → sets the current file for the opt-in ADE action
+ *   • renderAll()   → creates the ADE panel; extraction starts only on click
+ *   • resetApp()    → clears ADE state on a fresh upload
  * ════════════════════════════════════════════════════════════════════════ */
 
-var __ADE_DEFAULT_PARSE_URL = 'http://localhost:5059/api/parse';
+var __ADE_DEFAULT_PARSE_URL = 'http://127.0.0.1:5059/api/parse';
 var ADE_RESULT = null;  // last successful { markdown, page_count, chunks }
 var ADE_ERROR  = null;  // error message if the call failed
+var ADE_PROGRESS = '';
+var ADE_ACTIVE_JOB_ID = null;
 var __ADE_LAST_FILE = null; // most recently uploaded PDF, kept for retry
+var DOCLING_RESULT = null;
+var DOCLING_ERROR = '';
+var DOCLING_PROGRESS = '';
+var __DOCLING_DEFAULT_API_URL = 'http://127.0.0.1:5000/api/docling';
+
+function getDoclingApiURL() {
+  try { return localStorage.getItem('docling_api_url') || __DOCLING_DEFAULT_API_URL; }
+  catch (e) { return __DOCLING_DEFAULT_API_URL; }
+}
+
+function setDoclingApiURL(url) {
+  try { localStorage.setItem('docling_api_url', url); } catch (e) {}
+}
+
+function buildDoclingPanel() {
+  var url = escHtml(getDoclingApiURL());
+  var intro = '<div class="st">\uD83D\uDCE6 Local Docling <span class="bg bgn">Local backend</span></div>'
+    + '<div class="ss">Runs OCR and document-layout extraction with Docling on your own backend. '
+    + 'The PDF is sent to the configured endpoint (default: this computer); no LandingAI API or '
+    + 'per-page cloud charge is used. Docling may download model files the first time. '
+    + 'This extracts document content; it does not validate structural engineering.</div>'
+    + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:12px 0">'
+    + '<label for="doclingApiUrl" class="ss" style="margin:0">Backend endpoint</label>'
+    + '<input id="doclingApiUrl" type="url" value="' + url + '" '
+    + 'style="min-width:280px;max-width:100%;padding:8px 10px;background:var(--surface);'
+    + 'border:1px solid var(--border);border-radius:6px;color:var(--text)">'
+    + '<button class="bn" onclick="saveDoclingEndpoint()">Save endpoint</button></div>';
+  if (DOCLING_PROGRESS) {
+    return intro + '<div role="status" class="ss">' + escHtml(DOCLING_PROGRESS)
+      + '</div><div class="spin" style="margin:24px auto"></div>';
+  }
+  if (DOCLING_ERROR) {
+    intro += '<div role="alert" class="ss" style="color:var(--red);margin:12px 0">'
+      + escHtml(DOCLING_ERROR) + '</div>';
+  }
+  if (!DOCLING_RESULT) {
+    return intro + '<button class="ubtn" style="padding:10px 24px;font-size:13px" '
+      + 'onclick="startDoclingExtraction()" '
+      + (__ADE_LAST_FILE ? '' : 'disabled ')
+      + '>Extract with Docling locally</button>'
+      + (!__ADE_LAST_FILE ? '<div class="ss" style="margin-top:8px">Upload a PDF first.</div>' : '')
+      + '<div class="ss" style="margin-top:10px">If the backend reports Docling is missing, '
+      + 'install it from <code>backend/requirements-docling.txt</code> and restart Flask.</div>';
+  }
+  var markdown = DOCLING_RESULT.markdown || '';
+  var safeName = (__ADE_LAST_FILE ? __ADE_LAST_FILE.name : 'document')
+    .replace(/\.pdf$/i, '').replace(/[^a-z0-9_-]+/gi, '_');
+  return intro + '<div class="ss">Docling extracted ' + escHtml(DOCLING_RESULT.page_count)
+    + ' page' + (DOCLING_RESULT.page_count === 1 ? '' : 's') + '.</div>'
+    + '<div style="display:flex;gap:8px;margin:10px 0">'
+    + '<button class="bn" onclick="copyDoclingMarkdown()">Copy Markdown</button>'
+    + '<button class="bn" onclick="downloadDoclingMarkdown(\'' + safeName + '\')">Download .md</button>'
+    + '<button class="bn" onclick="startDoclingExtraction()">Run again</button></div>'
+    + '<pre style="max-height:500px;overflow:auto;background:var(--surface);border:1px solid '
+    + 'var(--border);border-radius:8px;padding:14px;font-size:11px;white-space:pre-wrap">'
+    + escHtml(markdown) + '</pre>';
+}
+
+function saveDoclingEndpoint() {
+  var input = document.getElementById('doclingApiUrl');
+  if (!input || !input.value.trim()) return;
+  setDoclingApiURL(input.value.trim().replace(/\/+$/, ''));
+  var host = document.getElementById('tab-docling');
+  if (host) host.innerHTML = buildDoclingPanel();
+}
+
+async function startDoclingExtraction() {
+  if (!__ADE_LAST_FILE) return;
+  var input = document.getElementById('doclingApiUrl');
+  if (input && input.value.trim()) setDoclingApiURL(input.value.trim().replace(/\/+$/, ''));
+  var baseUrl = getDoclingApiURL().replace(/\/+$/, '');
+  DOCLING_RESULT = null;
+  DOCLING_ERROR = '';
+  DOCLING_PROGRESS = 'Uploading PDF to the local Docling backend...';
+  var host = document.getElementById('tab-docling');
+  if (host) host.innerHTML = buildDoclingPanel();
+  try {
+    var form = new FormData();
+    form.append('file', __ADE_LAST_FILE, __ADE_LAST_FILE.name);
+    var startResponse = await fetch(baseUrl + '/extract', { method: 'POST', body: form });
+    var startData = await startResponse.json();
+    if (!startResponse.ok) throw new Error(startData.message || ('HTTP ' + startResponse.status));
+    var jobId = startData.data && startData.data.job_id;
+    if (!jobId) throw new Error('The local backend did not return a Docling job ID.');
+
+    for (var attempt = 0; attempt < 600; attempt++) {
+      DOCLING_PROGRESS = 'Docling is processing this PDF locally... (' + (attempt + 1) + ')';
+      if (host) host.innerHTML = buildDoclingPanel();
+      await new Promise(function(resolve) { setTimeout(resolve, 2000); });
+      var statusResponse = await fetch(baseUrl + '/status/' + encodeURIComponent(jobId));
+      var statusData = await statusResponse.json();
+      if (!statusResponse.ok) throw new Error(statusData.message || ('HTTP ' + statusResponse.status));
+      var job = statusData.data;
+      if (job.status === 'completed') {
+        DOCLING_RESULT = job.result;
+        break;
+      }
+      if (job.status === 'failed') {
+        throw new Error(job.error || 'Docling extraction failed.');
+      }
+      if (attempt === 599) throw new Error('Timed out waiting for Docling. Check the backend logs.');
+    }
+  } catch (error) {
+    DOCLING_ERROR = error.message || String(error);
+  } finally {
+    DOCLING_PROGRESS = '';
+    if (host) host.innerHTML = buildDoclingPanel();
+  }
+}
+
+function copyDoclingMarkdown() {
+  if (DOCLING_RESULT) navigator.clipboard.writeText(DOCLING_RESULT.markdown || '');
+}
+
+function downloadDoclingMarkdown(filename) {
+  if (!DOCLING_RESULT) return;
+  var blob = new Blob([DOCLING_RESULT.markdown || ''], { type: 'text/markdown' });
+  var link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = filename + '.md';
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
 
 function getADEApiKey() {
   try { return localStorage.getItem('ade_api_key') || ''; } catch (e) { return ''; }
@@ -6304,6 +6613,14 @@ function setADEProxyURL(u) {
   try { localStorage.setItem('ade_proxy_url', u); } catch (e) {}
 }
 
+function getADEJobsURL(jobId) {
+  var base = getADEProxyURL().replace(/\/+$/, '');
+  var jobsURL = /\/api\/parse(?:\/jobs)?$/.test(base)
+    ? base.replace(/\/api\/parse(?:\/jobs)?$/, '/api/parse/jobs')
+    : base + '/api/parse/jobs';
+  return jobsURL + (jobId ? '/' + encodeURIComponent(jobId) : '');
+}
+
 // Called by the "Save & Extract" button in the key-entry panel.
 function saveADEKeyAndRun() {
   var input = document.getElementById('adeKeyInput');
@@ -6316,10 +6633,10 @@ function saveADEKeyAndRun() {
   if (__ADE_LAST_FILE) fetchADEExtraction(__ADE_LAST_FILE);
 }
 
-function xhrPostForm(url, headers, formData) {
+function xhrADERequest(method, url, headers, formData) {
   return new Promise(function(resolve, reject) {
     var xhr = new XMLHttpRequest();
-    xhr.open('POST', url, true);
+    xhr.open(method, url, true);
     Object.keys(headers || {}).forEach(function(k) { xhr.setRequestHeader(k, headers[k]); });
     xhr.onload = function() {
       if (xhr.status >= 200 && xhr.status < 300) {
@@ -6330,13 +6647,59 @@ function xhrPostForm(url, headers, formData) {
       }
     };
     xhr.onerror = function() { reject(new Error('Network error calling ' + url)); };
-    xhr.send(formData);
+    xhr.send(formData || null);
   });
+}
+
+function extractADEChunks(data) {
+  if (Array.isArray(data.chunks)) {
+    return data.chunks.map(function(c) {
+      var g = c.grounding || {};
+      return { id: c.id, type: c.type, markdown: c.markdown || c.text || '',
+               grounding: { page: g.page != null ? g.page : (c.page != null ? c.page : null),
+                            box: g.box || null } };
+    });
+  }
+
+  var chunks = [];
+  var pages = data.structure && Array.isArray(data.structure.children)
+    ? data.structure.children : [];
+  function addNodes(nodes, pageNumber) {
+    (nodes || []).forEach(function(node) {
+      var grounding = node.grounding || {};
+      var nodePage = grounding.page != null ? grounding.page : pageNumber;
+      if (node.type === 'page') {
+        addNodes(node.children, nodePage);
+      } else if (node.type === 'table') {
+        var tableMarkdown = node.markdown || '';
+        if (!tableMarkdown && node.children) {
+          tableMarkdown = node.children.map(function(cell) { return cell.markdown || ''; })
+            .filter(Boolean).join(' | ');
+        }
+        if (tableMarkdown) chunks.push({
+          id: node.id, type: node.type, markdown: tableMarkdown,
+          grounding: { page: nodePage != null ? nodePage - 1 : null, box: grounding.box || null }
+        });
+      } else {
+        var markdown = node.markdown || '';
+        if (markdown) chunks.push({
+          id: node.id, type: node.type, markdown: markdown,
+          grounding: { page: nodePage != null ? nodePage - 1 : null, box: grounding.box || null }
+        });
+        if (node.children) addNodes(node.children, nodePage);
+      }
+    });
+  }
+  addNodes(pages, null);
+  return chunks;
 }
 
 async function fetchADEExtraction(file) {
   __ADE_LAST_FILE = file;
   ADE_RESULT = null; ADE_ERROR = null;
+  ADE_PROGRESS = ADE_ACTIVE_JOB_ID
+    ? 'Resuming ADE Standard Parse Job...'
+    : 'Submitting low-cost Standard Parse Job...';
   var apiKey = getADEApiKey();
   if (!apiKey) {
     var host0 = document.getElementById('tab-ade');
@@ -6349,24 +6712,86 @@ async function fetchADEExtraction(file) {
     var fd = new FormData();
     fd.append('document', file);
     fd.append('model', 'dpt-3-pro-latest');
-    var data = await xhrPostForm(getADEProxyURL(), { 'Authorization': 'Basic ' + apiKey }, fd);
+    fd.append('service_tier', 'standard');
+    fd.append('options', JSON.stringify({ inline_markdown: true }));
+    var headers = { 'Authorization': 'Basic ' + apiKey };
+    var job;
+    if (ADE_ACTIVE_JOB_ID) {
+      job = { job_id: ADE_ACTIVE_JOB_ID, status: 'pending' };
+    } else {
+      job = await xhrADERequest('POST', getADEJobsURL(), headers, fd);
+      if (!job.job_id) throw new Error('ADE did not return a Parse Job ID.');
+      ADE_ACTIVE_JOB_ID = job.job_id;
+    }
+
+    var data = null;
+    var maxPolls = 240;
+    for (var attempt = 0; attempt < maxPolls; attempt++) {
+      ADE_PROGRESS = 'ADE job ' + (job.status || 'pending') + ' (' + (attempt + 1) + ')...';
+      var pendingHost = document.getElementById('tab-ade');
+      if (pendingHost) pendingHost.innerHTML = buildADEPanel(null, null, false);
+      if (job.status === 'completed') {
+        data = job.result;
+        ADE_ACTIVE_JOB_ID = null;
+        break;
+      }
+      if (job.status === 'failed') {
+        ADE_ACTIVE_JOB_ID = null;
+        throw new Error(job.error && job.error.message ? job.error.message : 'ADE Parse Job failed.');
+      }
+      if (attempt + 1 < maxPolls) {
+        await new Promise(function(resolve) { setTimeout(resolve, 3000); });
+        job = await xhrADERequest('GET', getADEJobsURL(job.job_id), headers);
+      }
+    }
+    if (!data) throw new Error('Timed out waiting for ADE. Use Retry to resume this same job; it will not submit or charge for a second parse.');
+    if (data.result && !data.markdown) data = data.result;
     ADE_RESULT = {
       markdown: data.markdown,
       page_count: data.metadata ? data.metadata.page_count : null,
-      chunks: (data.chunks || []).map(function(c) {
-        var g = c.grounding || {};
-        return { id: c.id, type: c.type, markdown: c.markdown,
-                 grounding: { page: g.page != null ? g.page : null, box: g.box || null } };
-      })
+      billing: data.metadata && data.metadata.billing ? data.metadata.billing : null,
+      chunks: extractADEChunks(data)
     };
+    ADE_PROGRESS = '';
+    Object.keys(canvasRegistry).forEach(function(key) {
+      var reg = canvasRegistry[key];
+      drawADEGroundingOnCanvas(reg.canvas, reg.pageIdx, reg.scale);
+    });
     console.log('[ADE] parsed ' + ADE_RESULT.chunks.length + ' chunks across '
-                + (ADE_RESULT.page_count || 0) + ' pages');
+                + (ADE_RESULT.page_count || 0) + ' pages',
+                ADE_RESULT.billing || {});
   } catch (e) {
     ADE_ERROR = e.message;
+    ADE_PROGRESS = '';
     console.warn('[ADE] request failed: ', e.message);
   }
   var host2 = document.getElementById('tab-ade');
   if (host2) host2.innerHTML = buildADEPanel(ADE_RESULT, ADE_ERROR, false);
+}
+
+function drawADEGroundingOnCanvas(canvas, pageIdx, scale) {
+  if (!ADE_RESULT || !ADE_RESULT.chunks || !canvas) return;
+  var ctx = canvas.getContext('2d');
+  ADE_RESULT.chunks.forEach(function(chunk) {
+    var grounding = chunk.grounding || {};
+    var box = grounding.box;
+    if (grounding.page !== pageIdx || !box ||
+        !isFinite(box.xmin) || !isFinite(box.ymin) ||
+        !isFinite(box.xmax) || !isFinite(box.ymax)) return;
+    var x = box.xmin * canvas.width, y = box.ymin * canvas.height;
+    var w = (box.xmax - box.xmin) * canvas.width;
+    var h = (box.ymax - box.ymin) * canvas.height;
+    if (w <= 0 || h <= 0) return;
+    ctx.save();
+    ctx.strokeStyle = '#fbbf24';
+    ctx.fillStyle = 'rgba(251,191,36,0.06)';
+    ctx.lineWidth = Math.max(1, 1.5 * scale);
+    ctx.setLineDash([5 * scale, 3 * scale]);
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillRect(x, y, w, h);
+    ctx.setLineDash([]);
+    ctx.restore();
+  });
 }
 
 function escHtml(s) {
@@ -6397,6 +6822,9 @@ function goToPageTabFromADE(pageIdx) {
   }
   var panel = document.getElementById('tab-p' + pageIdx);
   if (panel) panel.classList.add('active');
+  ensurePageCanvas(pageIdx).catch(function(e) {
+    console.error('Could not open page for ADE chunk:', e);
+  });
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -6412,6 +6840,94 @@ function downloadADEMarkdown() {
 
 var ADE_PROXY_SOURCE = "\"\"\"\nade_proxy.py \u2014 local CORS proxy for the \"ADE Extract\" tab in StructuraVision.\n\nBrowsers block direct calls from a page to https://api.ade.landing.ai/v2/parse\n(CORS) \u2014 LandingAI's docs only show server-side examples, so the API isn't\nset up to accept arbitrary browser origins. This tiny Flask app sits on\nlocalhost (not cross-origin from the page's point of view) and simply\nforwards the request through.\n\nIt does NOT hold your API key \u2014 the browser sends whatever you typed into\nthe \"ADE Extract\" tab as an Authorization header, same as before, and this\njust relays it on to LandingAI. Nothing is stored server-side.\n\nSetup\n-----\n    pip install flask flask-cors requests\n    python ade_proxy.py\n\nListens on http://localhost:5059 (matches __ADE_PARSE_URL in the HTML).\nChange the port below and __ADE_PARSE_URL in the HTML together if you need\na different one.\n\"\"\"\n\nimport requests\nfrom flask import Flask, request, jsonify, Response\nfrom flask_cors import CORS\n\napp = Flask(__name__)\nCORS(app)  # allow the local HTML file / localhost page to call this\n\nADE_PARSE_URL = \"https://api.ade.landing.ai/v2/parse\"\n\n\n@app.post(\"/api/parse\")\ndef parse():\n    if \"document\" not in request.files:\n        return jsonify({\"error\": \"no 'document' file in request\"}), 400\n\n    auth_header = request.headers.get(\"Authorization\")\n    if not auth_header:\n        return jsonify({\"error\": \"missing Authorization header\"}), 401\n\n    upload = request.files[\"document\"]\n    model = request.form.get(\"model\", \"dpt-3-pro-latest\")\n\n    try:\n        resp = requests.post(\n            url=ADE_PARSE_URL,\n            headers={\"Authorization\": auth_header},\n            files=[(\"document\", (upload.filename, upload.stream, upload.mimetype))],\n            data={\"model\": model},\n        )\n        # Pass the upstream response straight through, success or failure,\n        # so the front end's error handling sees exactly what ADE said.\n        return Response(resp.content, status=resp.status_code, mimetype=\"application/json\")\n    except Exception as exc:\n        return jsonify({\"error\": str(exc)}), 502\n\n\nif __name__ == \"__main__\":\n    app.run(host=\"0.0.0.0\", port=5059)\n";
 
+ADE_PROXY_SOURCE = String.raw`"""
+ade_proxy.py — local CORS proxy for LandingAI ADE Parse Jobs.
+
+Setup:
+    pip install flask flask-cors requests
+    python ade_proxy.py
+"""
+
+import logging
+import requests
+from flask import Flask, Response, jsonify, request
+from flask_cors import CORS
+
+app = Flask(__name__)
+CORS(app)
+API_BASE = "https://api.ade.landing.ai/v2"
+logger = logging.getLogger(__name__)
+
+
+def forward_response(response):
+    return Response(response.content, status=response.status_code,
+                    mimetype=response.headers.get("Content-Type", "application/json"))
+
+
+def get_auth():
+    auth = request.headers.get("Authorization")
+    return {"Authorization": auth} if auth else None
+
+
+@app.post("/api/parse")
+def parse_sync():
+    auth = get_auth()
+    if not auth:
+        return jsonify({"error": "missing Authorization header"}), 401
+    if "document" not in request.files:
+        return jsonify({"error": "no 'document' file in request"}), 400
+    upload = request.files["document"]
+    try:
+        response = requests.post(
+            API_BASE + "/parse", headers=auth,
+            files=[("document", (upload.filename, upload.stream, upload.mimetype))],
+            data=request.form.to_dict(), timeout=180,
+        )
+        return forward_response(response)
+    except requests.RequestException as exc:
+        logger.exception("ADE synchronous parse request failed")
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.post("/api/parse/jobs")
+def create_parse_job():
+    auth = get_auth()
+    if not auth:
+        return jsonify({"error": "missing Authorization header"}), 401
+    if "document" not in request.files:
+        return jsonify({"error": "no 'document' file in request"}), 400
+    upload = request.files["document"]
+    try:
+        response = requests.post(
+            API_BASE + "/parse/jobs", headers=auth,
+            files=[("document", (upload.filename, upload.stream, upload.mimetype))],
+            data=request.form.to_dict(), timeout=180,
+        )
+        return forward_response(response)
+    except requests.RequestException as exc:
+        logger.exception("ADE Parse Job submission failed")
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.get("/api/parse/jobs/<job_id>")
+def get_parse_job(job_id):
+    auth = get_auth()
+    if not auth:
+        return jsonify({"error": "missing Authorization header"}), 401
+    try:
+        response = requests.get(
+            API_BASE + "/parse/jobs/" + job_id, headers=auth, timeout=45,
+        )
+        return forward_response(response)
+    except requests.RequestException as exc:
+        logger.exception("ADE Parse Job poll failed")
+        return jsonify({"error": str(exc)}), 502
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5059)
+`;
+
 function downloadADEProxyScript() {
   var blob = new Blob([ADE_PROXY_SOURCE], { type: 'text/x-python' });
   var a = document.createElement('a');
@@ -6422,6 +6938,54 @@ function downloadADEProxyScript() {
 }
 
 var ADE_WORKER_SOURCE = "/**\n * ade_worker.js \u2014 Cloudflare Worker relay for the \"ADE Extract\" tab in\n * StructuraVision, for machines where running a local Python proxy isn't\n * an option (locked-down/company laptops with no admin rights).\n *\n * Deploy (no installs, just a browser):\n *   1. Go to https://workers.cloudflare.com and sign up (free tier).\n *   2. Create a Worker, paste this file's contents in, replacing the\n *      default code.\n *   3. Click Deploy. You'll get a URL like\n *      https://ade-relay.<you>.workers.dev\n *   4. Paste that URL into the \"Proxy / Relay URL\" field in the\n *      ADE Extract tab.\n *\n * It does not store your API key \u2014 it only reads the Authorization\n * header the browser sends and passes it straight through to LandingAI.\n */\nexport default {\n  async fetch(request) {\n    if (request.method === \"OPTIONS\") {\n      return new Response(null, {\n        headers: {\n          \"Access-Control-Allow-Origin\": \"*\",\n          \"Access-Control-Allow-Methods\": \"POST, OPTIONS\",\n          \"Access-Control-Allow-Headers\": \"Authorization, Content-Type\",\n        },\n      });\n    }\n    if (request.method !== \"POST\") {\n      return new Response(\"Method not allowed\", { status: 405 });\n    }\n\n    const auth = request.headers.get(\"Authorization\");\n    if (!auth) {\n      return new Response(JSON.stringify({ error: \"missing Authorization header\" }), {\n        status: 401,\n        headers: { \"Content-Type\": \"application/json\", \"Access-Control-Allow-Origin\": \"*\" },\n      });\n    }\n\n    const formData = await request.formData();\n    const upstream = await fetch(\"https://api.ade.landing.ai/v2/parse\", {\n      method: \"POST\",\n      headers: { \"Authorization\": auth },\n      body: formData,\n    });\n\n    const body = await upstream.text();\n    return new Response(body, {\n      status: upstream.status,\n      headers: { \"Content-Type\": \"application/json\", \"Access-Control-Allow-Origin\": \"*\" },\n    });\n  },\n};\n";
+
+ADE_WORKER_SOURCE = String.raw`/**
+ * Cloudflare Worker relay for LandingAI ADE Parse and Standard Parse Jobs.
+ * The browser supplies the API key; this worker does not store it.
+ */
+export default {
+  async fetch(request) {
+    const cors = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    };
+    if (request.method === "OPTIONS") return new Response(null, { headers: cors });
+
+    const url = new URL(request.url);
+    const path = url.pathname === "/" ? "/api/parse/jobs" : url.pathname;
+    const isCreate = path === "/api/parse/jobs" && request.method === "POST";
+    const isPoll = /^\/api\/parse\/jobs\/[A-Za-z0-9_-]+$/.test(path) && request.method === "GET";
+    const isLegacyParse = path === "/api/parse" && request.method === "POST";
+    if (!isCreate && !isPoll && !isLegacyParse) {
+      return new Response(JSON.stringify({ error: "Unsupported ADE relay route." }), {
+        status: 404, headers: { ...cors, "Content-Type": "application/json" },
+      });
+    }
+
+    const auth = request.headers.get("Authorization");
+    if (!auth) {
+      return new Response(JSON.stringify({ error: "missing Authorization header" }), {
+        status: 401, headers: { ...cors, "Content-Type": "application/json" },
+      });
+    }
+
+    const upstreamPath = isLegacyParse ? "/parse" : path.replace(/^\/api/, "");
+    const init = { method: request.method, headers: { "Authorization": auth } };
+    if (request.method === "POST") init.body = await request.formData();
+    try {
+      const upstream = await fetch("https://api.ade.landing.ai/v2" + upstreamPath, init);
+      return new Response(await upstream.text(), {
+        status: upstream.status,
+        headers: { ...cors, "Content-Type": upstream.headers.get("Content-Type") || "application/json" },
+      });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: "ADE upstream request failed: " + error.message }), {
+        status: 502, headers: { ...cors, "Content-Type": "application/json" },
+      });
+    }
+  },
+};`;
 
 function downloadADEWorkerScript() {
   var blob = new Blob([ADE_WORKER_SOURCE], { type: 'text/javascript' });
@@ -6481,20 +7045,9 @@ function buildADEKeyPanel(errMsg) {
     + '<div class="ss" style="font-family:monospace;font-size:11px;background:var(--surface);'
     +   'border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:14px">'
     +   'pip install flask flask-cors requests<br>python ade_proxy.py'
-    +   '<br># then set the Relay URL above to http://localhost:5059/api/parse'
+    +   '<br># then set the Relay URL above to http://127.0.0.1:5059/api/parse'
     + '</div>'
 
-    + '<div class="ss" style="margin-bottom:8px">'
-    +   '<b>Option C \u2014 no second file, but weakens browser security for that session:</b> launch a '
-    +   'throwaway browser profile with CORS checks off, then open this HTML file inside it. Skip this '
-    +   'on a managed company laptop \u2014 policy may block the flag anyway, and it disables CORS '
-    +   'protection for everything in that session, not just this page.'
-    + '</div>'
-    + '<div class="ss" style="font-family:monospace;font-size:11px;background:var(--surface);'
-    +   'border:1px solid var(--border);border-radius:8px;padding:10px">'
-    +   'macOS:&nbsp; open -na "Google Chrome" --args --user-data-dir="/tmp/ade-tool" --disable-web-security<br>'
-    +   'Windows: chrome.exe --user-data-dir="C:\\temp\\ade-tool" --disable-web-security'
-    + '</div>'
     + '</div>';
 }
 
@@ -6504,11 +7057,25 @@ function buildADEPanel(data, err, needsKey) {
     if (err) {
       return buildADEKeyPanel('Request failed: ' + err
         + ' — check that the relay URL (' + escHtml(getADEProxyURL()) + ') is correct and running, '
-        + 'then click Save & Extract again.');
+        + 'then click Save & Extract again. '
+        + (ADE_ACTIVE_JOB_ID ? 'The current job will be resumed, not re-submitted.' : ''));
+    }
+    if (!ADE_PROGRESS) {
+      var pagesToParse = PDF && PDF.numPages ? PDF.numPages : 0;
+      var baseCredits = pagesToParse ? pagesToParse * 0.5 : 0;
+      return '<div class="st">\uD83E\uDDEC ADE Extraction <span class="bg bgn">LandingAI</span></div>'
+        + '<div class="ss">Optional image/layout extraction for scanned or image-heavy PDFs. '
+        + 'Uses DPT-3 Pro on the lower-cost Standard job tier; no API call is made until you start it. '
+        + 'LandingAI charges $0.01 per credit; Standard Pro is 0.5 credits/page + 0.25 credits/1,000 output characters. '
+        + (baseCredits ? 'For ' + pagesToParse + ' pages, the page charge starts at about $'
+          + (baseCredits * 0.01).toFixed(2) + ', plus output characters. ' : '')
+        + 'Check the returned billing metadata for the exact cost.</div>'
+        + '<button class="ubtn" style="padding:10px 24px;font-size:13px" '
+        + 'onclick="if(__ADE_LAST_FILE)fetchADEExtraction(__ADE_LAST_FILE)" '
+        + ( __ADE_LAST_FILE ? '' : 'disabled ') + '>Extract with ADE (Standard)</button>';
     }
     return '<div class="st">\uD83E\uDDEC ADE Extraction <span class="bg bgn">LandingAI</span></div>'
-      + '<div class="ss">Parsing the document via LandingAI ADE (Markdown + chunk-level structure)… '
-      + 'this runs alongside the other analyses and can take a little longer.</div>'
+      + '<div class="ss">' + escHtml(ADE_PROGRESS || 'Submitting document to LandingAI ADE...') + '</div>'
       + '<div class="spin" style="margin:24px auto"></div>';
   }
   var chunks = data.chunks || [];
@@ -6541,6 +7108,10 @@ function buildADEPanel(data, err, needsKey) {
     + '<div class="ss">Document parsed into Markdown + ' + chunks.length + ' chunk'
     + (chunks.length === 1 ? '' : 's') + ' across ' + (data.page_count || '?') + ' page'
     + ((data.page_count || 0) === 1 ? '' : 's') + '.'
+    + (data.billing && data.billing.total_credits != null
+        ? ' Actual usage: ' + escHtml(data.billing.total_credits) + ' credits (about $'
+          + escHtml((Number(data.billing.total_credits) * 0.01).toFixed(2)) + ' at $0.01/credit).'
+        : '')
     + ' <a href="#" onclick="fetchADEExtraction(__ADE_LAST_FILE);return false" '
     + 'style="color:var(--cyan)">re-run</a></div>'
     + '<div class="gf">' + chips + '</div>'
